@@ -1,4 +1,3 @@
-# Group2_POC_Bootcamp_Project
 # 🌌 OmniRoute: Enterprise Logistics Data Platform
 
 ![OmniRoute Banner](https://img.shields.io/badge/Architecture-Lambda-blueviolet?style=for-the-badge)
