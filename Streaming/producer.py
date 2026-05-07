@@ -20,7 +20,7 @@ log = logging.getLogger("omniroute-simulator")
 
 def load_events() -> list:
     if not os.path.exists(DATA_FILE):
-        raise FileNotFoundError(f"❌ Could not find {DATA_FILE}. Ensure it is in the same directory.")
+        raise FileNotFoundError(f"Could not find {DATA_FILE}. Ensure it is in the same directory.")
     
     with open(DATA_FILE, "r") as f:
         events = json.load(f)
@@ -59,7 +59,7 @@ def run_batch(producer: KafkaProducer, events: list):
                 log.error(f"Publish error (event {i}): {e}")
                 
     producer.flush()
-    log.info(f"✅ Batch complete: {len(events) - errors:,} sent, {errors} errors")
+    log.info(f"Batch complete: {len(events) - errors:,} sent, {errors} errors")
 
 def run_stream(producer: KafkaProducer, events: list, rate: float):
     delay = 1.0 / rate
@@ -80,7 +80,7 @@ def run_stream(producer: KafkaProducer, events: list, rate: float):
                 time.sleep(delay)
             log.warning("🔄 Reached end of static file. Looping back to the beginning...")
     except KeyboardInterrupt:
-        log.info("🛑 Keyboard interrupt received.")
+        log.info(" Keyboard interrupt received.")
     finally:
         log.info(f"🧹 Flushing buffer... Total published in this session: {count:,}")
         producer.flush()
@@ -98,7 +98,7 @@ def main():
     
     events = load_events()
     producer = make_producer(args.brokers)
-    log.info("✅ Connected to Kafka")
+    log.info("Connected to Kafka")
 
     try:
         if args.mode == "batch":
@@ -106,10 +106,10 @@ def main():
         else:
             run_stream(producer, events, args.rate)
     except Exception as e:
-        log.error(f"❌ Fatal Error: {e}")
+        log.error(f"Fatal Error: {e}")
     finally:
         producer.close()
-        log.info("✅ Producer shut down safely.")
+        log.info("Producer shut down safely.")
 
 if __name__ == "__main__":
     main()
