@@ -7,9 +7,7 @@ from pyspark.sql.functions import (
 )
 from pyspark.sql.window import Window
 
-# -------------------------------
-# PARAMETERS
-# -------------------------------
+
 parser = argparse.ArgumentParser()
 
 parser.add_argument("--ingestion_date", required=True)
@@ -26,9 +24,6 @@ DB_NAME = args.db_name
 DB_USER = args.db_user
 DB_PASS = args.db_password
 
-# -------------------------------
-# PATHS
-# -------------------------------
 SILVER_FUEL_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/fact_fuel_transactions"
 DIM_VEHICLE_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_vehicle"
 DIM_DATE_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_date"
@@ -36,9 +31,6 @@ DIM_MAINTENANCE_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-
 
 GOLD_PATH = "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-grp2-gold/fuel_efficiency_audit"
 
-# -------------------------------
-# MAIN
-# -------------------------------
 def main():
 
     spark = SparkSession.builder \
@@ -50,9 +42,6 @@ def main():
 
     spark.sparkContext.setLogLevel("WARN")
 
-    # -------------------------------
-    # LOAD
-    # -------------------------------
     fuel_df = spark.read.format("delta").load(SILVER_FUEL_PATH)
     vehicle_df = spark.read.format("delta").load(DIM_VEHICLE_PATH)
     date_df = spark.read.format("delta").load(DIM_DATE_PATH)
@@ -62,27 +51,21 @@ def main():
 
     # ── FILTER TO THIS INGESTION BATCH ───────────────────────────────────
     # Source data is historical (event timestamps are old dates).
-    # Job 3 stamps every row with ingestion_date = the date the job ran.
-    # We filter on ingestion_date (processing batch key), NOT transaction_date
-    # (the actual event date from the old data) to get this run's records.
+    # So we filter on ingestion_date (processing batch key), NOT transaction_date
     batch_df = fuel_df.filter(col("ingestion_date") == INGESTION_DATE)
     batch_count = batch_df.count()
-    print(f"📊 ingestion_date='{INGESTION_DATE}' batch size: {batch_count} rows")
+    
 
     if batch_count == 0:
-        print(f"⚠️ No fuel records for ingestion_date={INGESTION_DATE}. "
-              f"Ensure Job 3 ran successfully for this date first.")
         spark.stop()
         return
 
     # Get the distinct VINs present in this batch
     batch_vins = batch_df.select("vin").distinct()
 
-    # Keep ALL historical Silver rows for those VINs so the LAG window
-    # can compute distance from the previous odometer reading
+    # Keep ALL historical Silver rows for those VINs so the LAG window can compute distance from the previous odometer reading
     fuel_df = fuel_df.join(batch_vins, "vin", "inner")
 
-    # ── LAG LOGIC (needs full VIN history for correct prev_odometer) ───────
     window_spec = Window.partitionBy("vin") \
         .orderBy("event_timestamp", "odometer_reading")
 
@@ -90,7 +73,6 @@ def main():
         .withColumn("prev_odometer", lag("odometer_reading").over(window_spec)) \
         .withColumn("distance_driven", col("odometer_reading") - col("prev_odometer"))
 
-    # ── FILTER: keep only THIS BATCH's rows with valid distance ────────────
     # After LAG, filter back to ingestion_date=INGESTION_DATE rows only.
     # This ensures prev_odometer used full history but results are for this batch.
     fuel_df = fuel_df \
@@ -101,22 +83,17 @@ def main():
             (col("distance_driven") > 0) &
             (col("distance_driven") <= 2000)
         )
-    print(f"=== after LAG + validity filter: {fuel_df.count()} rows ===")
-
-    # ── JOIN DIM_VEHICLE ─────────────────────────────────────────────
+    # ── JOIN DIM_VEHICLE ───
     fuel_df = fuel_df.join(vehicle_df, "vin") \
         .filter(col("baseline_kmpl").isNotNull())
     print(f"=== after dim_vehicle join: {fuel_df.count()} rows ===")
 
-    # ── JOIN DIM_DATE on transaction_date (actual event date) ──────────────
-    # We still use transaction_date here to exclude weekends in the vehicle's
-    # actual operating calendar (BRD requirement).
     date_for_join = date_df.select(col("date").alias("transaction_date"), "is_weekend")
     fuel_df = fuel_df.join(date_for_join, "transaction_date") \
         .filter(col("is_weekend") == False)
     print(f"=== after dim_date (weekday filter): {fuel_df.count()} rows ===")
 
-    # ── MAINTENANCE ANTI-JOIN ──────────────────────────────────────
+    # remove maintenance days
     fuel_df = fuel_df.join(
         maintenance_df.select(
             col("vin").alias("m_vin"),
@@ -160,47 +137,34 @@ def main():
         ) \
         .withColumn("ingestion_timestamp", current_timestamp())
 
-    # ── DEDUP: keep ONE row per VIN (the latest audit_date) ───────────────
-    # BRD Gold layer = "current status" of each vehicle.
-    # The batch may contain many transaction_dates for the same VIN;
-    # we keep only the most recent one so the Gold table has 1 row per VIN.
-    # ROW_NUMBER is deterministic because audit_date is a date (no ties).
     latest_window = Window.partitionBy("vin").orderBy(desc("audit_date"))
     final_df = (
         final_df
         .withColumn("_rn", row_number().over(latest_window))
         .filter(col("_rn") == 1)
         .drop("_rn")
-        # Stamp the batch key so S3 partitioning is by ingestion run, not event date.
         .withColumn("ingestion_date", lit(INGESTION_DATE))
     )
 
-    # Cache final_df: it is used TWICE below (S3 write + JDBC write).
+    # Cache final_df: it is used TWICE below (S3 write + JDBC write)
     # Without cache(), Spark recomputes the entire DAG from Silver for each write action,
     # and the second computation races with spark.stop() → SparkContext cancellation errors.
     final_df = final_df.cache()
     row_count = final_df.count()
-    print(f"📊 final_df row count for {INGESTION_DATE}: {row_count}")
+    print(f"final_df row count for {INGESTION_DATE}: {row_count}")
 
     if row_count == 0:
-        print(f"⚠️ No qualifying fuel transactions for {INGESTION_DATE}.")
-        print("Possible causes: (1) job3 has not yet run for this date, "
-              "(2) all records were weekends/maintenance days, "
-              "(3) no vehicles had a valid previous odometer reading.")
-        print("🎯 Exiting cleanly — no Gold write needed.")
+        print(f"No qualifying fuel transactions for {INGESTION_DATE}.")
         spark.stop()
         return
 
-    # ── WRITE S3 (partition by ingestion_date = 1 folder per run) ───────────
-    print(f"💾 Writing {row_count} rows to Gold S3 (ingestion_date={INGESTION_DATE})...")
     final_df.write \
         .format("delta") \
         .mode("overwrite") \
         .partitionBy("ingestion_date") \
         .option("replaceWhere", f"ingestion_date = '{INGESTION_DATE}'") \
         .save(GOLD_PATH)
-    print("✅ Gold S3 write successful.")
-
+ 
     # ── WRITE POSTGRES (truncate → append → upsert) ─────────────────
     print("📡 Writing to Postgres...")
     jdbc_url = f"jdbc:postgresql://{DB_HOST}:5432/{DB_NAME}"
@@ -244,10 +208,9 @@ def main():
         cur  = conn.cursor()
         cur.execute(upsert_sql)
         conn.commit()
-        print("✅ Postgres UPSERT successful.")
+
     except Exception as e:
         if conn: conn.rollback()
-        print(f"❌ Postgres write failed: {e}")
         raise
     finally:
         if cur:  cur.close()
@@ -255,8 +218,6 @@ def main():
 
     final_df.unpersist()   # release cached memory after both writes are done
     spark.stop()
-    print("🎯 Job completed successfully")
-
 
 if __name__ == "__main__":
     main()
