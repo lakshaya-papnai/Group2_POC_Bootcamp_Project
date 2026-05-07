@@ -1,12 +1,10 @@
 """
-OmniRoute — Job 8: Monthly Cooldown (Rollover) + Rate Deduction Report
-======================================================================
-
+Job 8: Monthly Cooldown (Rollover) + Rate Deduction Report
 Runs on the 1st of every month via omniroute_monthly_dag.
 
 This job performs three operations IN ORDER:
 
-  1. REPORT GENERATION (BRD §6.5.1)
+  1. REPORT GENERATION 
      Reads PREVIOUS month's Gold data and FULL OUTER JOINs with active SCD2
      fleet to produce a Monthly Driver Rate Deduction Report (.txt).
      This captures the month-end state BEFORE any rollover happens.
@@ -20,11 +18,6 @@ This job performs three operations IN ORDER:
   3. POSTGRES SYNC
      Inserts the new-month rollover rows into Postgres using the staging
      table pattern (TRUNCATE staging → JDBC write → UPSERT to target).
-
-WHY ROLLOVER INSTEAD OF UPDATE?
-  An in-place UPDATE would overwrite May's rows, destroying historical records.
-  With rollover, each month is an immutable partition. HR can always query
-  any past month to see the exact state at that time.
 """
 
 import argparse
@@ -77,12 +70,7 @@ PG_CONNECT = {
     "password": args.db_password,
 }
 
-
-# ─────────────────────────────────────────────────────────────────
-# POSTGRES SYNC (staging table pattern, same as processor.py)
-# ─────────────────────────────────────────────────────────────────
 def sync_to_postgres(df):
-    """Write rollover rows to Postgres via staging table upsert."""
     if df.rdd.isEmpty():
         print("No rows to sync to Postgres.")
         return
@@ -126,11 +114,11 @@ def sync_to_postgres(df):
         cur = conn.cursor()
         cur.execute(upsert_sql)
         conn.commit()
-        print(f"✅ Postgres UPSERT complete — {tgt_table}")
+        print(f"Postgres UPSERT complete — {tgt_table}")
         cur.close()
     except Exception as e:
         conn.rollback()
-        print(f"❌ Postgres UPSERT failed: {e}")
+        print(f"Postgres UPSERT failed: {e}")
         raise
     finally:
         conn.close()
@@ -209,15 +197,12 @@ def generate_report(report_df):
     s3 = boto3.client("s3")
     s3.put_object(Bucket=GOLD_BUCKET, Key=s3_key,
                   Body=report_text.encode("utf-8"), ContentType="text/plain")
-    print(f"✅ Report uploaded → s3://{GOLD_BUCKET}/{s3_key}")
+    print(f"Report uploaded → s3://{GOLD_BUCKET}/{s3_key}")
     print(f"\nREPORT PREVIEW:\n{report_text[:800]}")
 
 
-# ─────────────────────────────────────────────────────────────────
-# MAIN
-# ─────────────────────────────────────────────────────────────────
 def main():
-    print(f"🚀 Job 8: Monthly Cooldown for execution_date={EXECUTION_DATE}")
+    print(f"Job 8: Monthly Cooldown for execution_date={EXECUTION_DATE}")
     print(f"   Previous month : {prev_month}")
     print(f"   New month      : {new_month}")
 
@@ -230,7 +215,7 @@ def main():
         .getOrCreate()
     )
 
-    # ── A. READ PREVIOUS MONTH'S GOLD DATA ───────
+    # READ PREVIOUS MONTH'S GOLD DATA 
     has_prev_data = False
     prev_gold_df  = None
 
@@ -243,12 +228,12 @@ def main():
             print(f"📖 Found {prev_gold_df.count()} driver(s) in Gold for {prev_month}.")
             
     if not has_prev_data:
-        print(f"⏭️  No previous month data found for {prev_month}. Skipping report generation and cooldown/rollover.")
-        print("🏁 Job 8 complete.")
+        print(f"No previous month data found for {prev_month}. Skipping report generation and cooldown/rollover.")
+        print("Job 8 complete.")
         spark.stop()
         return
 
-    # ── B. READ ACTIVE FLEET FROM SCD2 ────────────────────────────
+    #READ ACTIVE FLEET FROM SCD2
     scd2_df = (
         spark.read.format("delta").load(SCD2_PATH)
         .filter(F.col("status") == "IN-TRANSIT")
@@ -257,13 +242,9 @@ def main():
     )
     print(f"📖 Found {scd2_df.count()} active driver(s) in SCD2.")
 
-    # ── C. GENERATE REPORT (BEFORE rollover — captures month-end state) ──
-    print("📊 Generating Monthly Report...")
+    # GENERATE REPORT 
     # FULL OUTER JOIN: Gold (prev month) ⟷ SCD2 (active fleet)
-    # This captures:
-    #   - Drivers with violations (in Gold)
-    #   - Drivers who never violated (only in SCD2)
-    #   - Drivers who left the fleet (only in Gold)
+  
     gold_for_report = prev_gold_df.select(
         F.col("driver_id").alias("g_driver_id"),
         F.col("base_rate").alias("g_base_rate"),
@@ -290,14 +271,13 @@ def main():
 
     generate_report(report_df)
 
-    # ── D. ROLLOVER — CREATE NEW MONTH ROWS ───────────────────────
+    # ROLLOVER — CREATE NEW MONTH ROWS
     print(f"🔄 Creating rollover rows for {new_month}...")
 
     # EXCEPTION PATTERN: Only rollover drivers who had violations last month.
     # ACTIVE drivers (who had 1-9 strikes) reset to 0 strikes.
     # SUSPENDED drivers (10 strikes) carry forward as SUSPENDED.
-    
-    # 4. Apply the exact BRD Cooldown Rules
+   
     rollover_df = (
         prev_gold_df
         .withColumn("month", F.lit(new_month))
@@ -318,9 +298,6 @@ def main():
     print(f"   RESET TO 0 STRIKES  : {active_count} driver(s)")
     print(f"   SUSPENDED (carried) : {suspended_count} driver(s)")
 
-    # Write to Gold Delta — use MERGE for idempotency.
-    # If Job 8 reruns, or streaming already wrote some June rows,
-    # MERGE only inserts rows that don't already exist.
     if DeltaTable.isDeltaTable(spark, GOLD_DELTA_PATH):
         target = DeltaTable.forPath(spark, GOLD_DELTA_PATH)
         target.alias("t").merge(
@@ -340,13 +317,9 @@ def main():
             .mode("overwrite").partitionBy("month") \
             .save(GOLD_DELTA_PATH)
 
-    print("✅ Gold Delta rollover complete.")
 
-    # ── E. SYNC TO POSTGRES ───────────────────────────────────
-    print("🔄 Syncing rollover to Postgres...")
+    # SYNC TO POSTGRES
     sync_to_postgres(rollover_df)
-
-    print("🏁 Job 8 complete.")
     spark.stop()
 
 
