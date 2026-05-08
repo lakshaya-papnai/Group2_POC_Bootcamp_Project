@@ -1,11 +1,11 @@
 # 🌌 OmniRoute: Enterprise Logistics Data Platform
 
-![OmniRoute Banner](https://img.shields.io/badge/Architecture-Lambda-blueviolet?style=for-the-badge)
+![Architecture](https://img.shields.io/badge/Architecture-Medallion%20|%20Lambda-blueviolet?style=for-the-badge)
 ![AWS](https://img.shields.io/badge/AWS-S3%20|%20Glue%20|%20EMR-orange?style=for-the-badge&logo=amazon-aws)
-![Spark](https://img.shields.io/badge/Spark-Structured%20Streaming-E25A1C?style=for-the-badge&logo=apache-spark)
-![Airflow](https://img.shields.io/badge/Orchestration-Airflow-017CEE?style=for-the-badge&logo=apache-airflow)
+![Spark](https://img.shields.io/badge/Apache%20Spark-Structured%20Streaming-E25A1C?style=for-the-badge&logo=apache-spark)
+![Airflow](https://img.shields.io/badge/Orchestration-Apache%20Airflow-017CEE?style=for-the-badge&logo=apache-airflow)
 
-OmniRoute is a robust, production-grade logistics analytics platform designed to handle massive telemetry streams and batch organizational data. It implements a multi-layered Data Lake (Bronze-Silver-Gold) to provide real-time driver safety monitoring, fuel efficiency audits, and immutable fleet history.
+**OmniRoute** is a highly fault-tolerant, production-grade logistics analytics platform. It processes massive telemetry streams alongside batch organizational data through a multi-layered Medallion Architecture (Bronze, Silver, Gold) to deliver real-time driver safety monitoring, automated fuel efficiency audits, and immutable fleet history tracking.
 
 ---
 
@@ -13,129 +13,108 @@ OmniRoute is a robust, production-grade logistics analytics platform designed to
 
 ```mermaid
 graph TD
-    subgraph "1. Data Sources"
+    subgraph "1. Data Sources (Bronze)"
         A[Kafka Telemetry] -->|Real-time| B(processor.py)
-        C[S3 Raw CSVs] -->|Batch| D(AWS Glue Jobs)
+        C[S3 Raw CSVs/JSON] -->|Batch| D(AWS Glue Jobs)
     end
 
-    subgraph "2. Processing Layers"
-        B -->|Violation Detection| E[(Silver: fact_safety_violations)]
-        D -->|Ingestion/SCD2| F[(Silver: dim_asset_history_scd2)]
-        D -->|Cleansing| G[(Silver: fact_fuel_transactions)]
+    subgraph "2. Processing Layers (Silver)"
+        B -->|Violation Detection| E[(fact_safety_violations)]
+        D -->|SCD2 Engine| F[(dim_asset_history_scd2)]
+        D -->|Cleansing| G[(fact_fuel_transactions)]
+        D -->|Core Dims| DIMS[(dim_vehicle, dim_date, etc)]
     end
 
     subgraph "3. Serving Layer (Gold)"
-        E -->|Daily Aggs| H[(Gold: daily_safety_summary)]
-        F -->|Snapshot| I[(Gold: active_fleet_snapshot)]
-        G -->|Audit| J[(Gold: fuel_efficiency_audit)]
-        B & D -->|Sync| K[(PostgreSQL RDS)]
+        E -->|Daily KPI| H[(safety_compliance_summary)]
+        F & DIMS -->|Snapshot| I[(active_fleet_snapshot)]
+        G & DIMS -->|Audit| J[(fuel_efficiency_audit)]
+        E & F -->|Monthly| M[(driver_safety_status)]
+        B & D -->|Staging Sync| K[(PostgreSQL RDS)]
     end
 
     subgraph "4. Consumption"
-        K --> L[PowerBI / Dashboards]
-        H & J --> M[Executive Reports]
+        K --> L[PowerBI / Real-Time Dashboards]
+        H & J & M --> EX[Executive & HR Reports]
     end
 ```
 
 ---
 
-## 🚀 Tech Stack
+## 📂 Medallion Data Architecture
 
-- **Compute**: AWS Glue (Spark 3.3), EMR (Spark Streaming).
-- **Storage**: AWS S3 (Delta Lake format for ACID transactions).
-- **Messaging**: Apache Kafka (Self-hosted on EC2).
-- **Database**: PostgreSQL (Serving layer with atomic Upsert logic).
-- **Orchestration**: Apache Airflow (Fault-tolerant DAGs with S3 Sensors).
-- **Logic**: PySpark, Python (psycopg2, boto3).
+OmniRoute strictly adheres to the Medallion architecture, ensuring data quality increases as it moves through the pipeline. All tables from Silver onwards are stored in **Delta Lake** format on Amazon S3.
 
----
+### 🥉 Bronze Layer (Raw & Processed Data)
+The ingestion zone for immutable, raw data assets. Processed data passes a "Data Firewall" to strip whitespace and enforce strict schema types.
+*   **`vehicle_registry.csv`**: Master list of vehicles.
+*   **`restricted_zones.json`**: Geofence coordinate boundaries.
+*   **`vehicle_assignment*.csv`**: Incremental driver-to-vehicle assignments.
+*   **`fuel_transactions.csv`**: Raw fuel receipts and volumes.
+*   **`maintenance_schedules.csv`**: Annual fleet maintenance records.
+*   **`kafka_telemetry`**: 1-second JSON telemetry stream (Speed, GPS, VIN, Driver ID).
 
-## 📂 Data Lake Layers
+### 🥈 Silver Layer (Cleaned, Enriched, Conformed)
+The enterprise truth layer. Data is deduplicated, structured, and joined with core dimensions.
+*   **`dim_vehicle`**: Conformed vehicle metadata (model, make, fuel capacity).
+*   **`dim_date`**: Master date dimension for robust chronological joins.
+*   **`dim_restricted_zones`**: Flattened, queryable geofence definitions.
+*   **`dim_asset_history_scd2`**: The heartbeat of the fleet. Implements Slowly Changing Dimensions (Type 2) to track exactly which driver was in which vehicle down to the second.
+*   **`dim_maintenance_schedule`**: Validated maintenance windows.
+*   **`fact_fuel_transactions`**: Deterministically deduplicated fuel receipts.
+*   **`fact_safety_violations`**: Streaming event logs for Speeding and Geofence violations.
 
-### 🥉 Bronze (Raw & Processed)
-- **Raw**: Landed CSVs from vehicle registry, assignments, fuel, and maintenance.
-- **Processed**: Initial "Data Firewall" pass. Trims whitespace, handles nulls, and validates basic schema integrity before partitioning by `ingestion_date`.
-
-### 🥈 Silver (Cleaned & Curated)
-- **`dim_asset_history_scd2`**: The heartbeat of the fleet. Implements Slowly Changing Dimensions (Type 2) to track which driver was in which vehicle at any specific second in history.
-- **`fact_fuel_transactions`**: Deduped and enriched fuel receipts.
-- **`dim_vehicle`**: Master vehicle registry with model and metadata.
-
-### 🥇 Gold (Business Metrics)
-- **`driver_safety_status`**: Monthly snapshot of driver performance. Tracks "Strikes" for Speeding and Geofence violations.
-- **`fuel_efficiency_audit`**: Calculates KMPL (Kilometers Per Liter) by joining fuel logs with historical odometer readings.
-- **`active_fleet_snapshot`**: Daily count of "In-Transit" vehicles grouped by model.
-
----
-
-## 🛠️ The Batch Pipeline (Glue Jobs 1-8)
-
-| Job | Name | Purpose |
-| :--- | :--- | :--- |
-| **Job 1** | `dim_core_load` | Loads vehicle registry and restricted zone geofences (JSON to Delta). |
-| **Job 2** | `asset_scd2_engine` | The complex SCD2 engine. Handles incremental driver-to-vehicle assignments. |
-| **Job 3** | `fuel_enrichment` | Cleanses raw fuel logs and performs deterministic deduplication. |
-| **Job 4** | `fuel_audit` | Logic for fuel auditing and consumption analysis. |
-| **Job 5** | `fleet_snapshot` | Generates a daily aggregation of the active fleet for management. |
-| **Job 6** | `safety_summary` | Daily KPI generator (Total Violations, Top 10 Offenders). |
-| **Job 7** | `maintenance_load` | Yearly ingestion of maintenance logs for predictive analysis. |
-| **Job 8** | `monthly_cooldown` | **Monthly Rollover.** Resets strikes for safe drivers and generates PDF/TXT reports. |
+### 🥇 Gold Layer (Business-Level Aggregations)
+Highly refined datasets built specifically for BI dashboards, reporting, and business logic enforcement.
+*   **`active_fleet_snapshot`**: Daily point-in-time state of the entire "IN-TRANSIT" fleet.
+*   **`fuel_efficiency_audit`**: Cross-dimensional aggregations calculating KMPL (Kilometers Per Liter) and identifying fuel fraud.
+*   **`safety_compliance_summary`**: Daily KPIs including total violations and Top 10 worst offenders.
+*   **`driver_safety_status`**: Monthly tracking of driver suspension states, strikes, and rate deductions.
+*   **`driver_rate_deduction_report.txt`**: Generated physical reports for HR payload exports.
 
 ---
 
-## ⚡ Real-Time Streaming (`processor.py`)
+## 🛠️ The Batch Pipeline (AWS Glue)
 
-The streaming engine consumes from Kafka and processes telemetry at 1-second intervals:
-1. **Violation Detection**:
-   - **Speeding**: Threshold-based checks.
-   - **Geofence**: Spatial joins against `dim_restricted_zones` using high-precision `DoubleType` coordinates.
-2. **Circuit Breaker**: If a driver is marked `SUSPENDED` in PostgreSQL, the streaming engine detects this mid-stream and ignores their telemetry until they are reinstated.
-3. **Atomic Sync**: Uses the **Staging Table Pattern** in PostgreSQL to ensure that a failed Spark write never leaves the dashboard in a half-updated state.
+Orchestrated via Apache Airflow, the batch pipeline consists of 8 highly modular AWS Glue PySpark jobs.
 
----
-
-## 🌬️ Orchestration & Fault Tolerance
-
-Managed via **Airflow** with a focus on "Skip-on-Missing" logic:
-- **S3KeySensors**: Wait for files for 1 hour. If they don't arrive, the sensor skips, and all dependent Glue jobs skip automatically.
-- **Trigger Rules**: `none_failed_min_one_success` ensures that if Fuel data is missing, the Safety pipeline still executes correctly.
+| Job | Name | Layer Focus | Core Purpose |
+| :--- | :--- | :--- | :--- |
+| **Job 1** | `dim_core_load` | 🥉 → 🥈 | Ingests vehicle registry and restricted zones (JSON/CSV) into Delta format. |
+| **Job 2** | `asset_scd2_engine` | 🥉 → 🥈 | Complex SCD2 engine utilizing Window functions to manage incremental driver assignments. |
+| **Job 3** | `fuel_enrichment` | 🥉 → 🥈 | Cleanses and deterministically deduplicates raw fuel logs. |
+| **Job 4** | `gold_fuel_audit` | 🥈 → 🥇 | Massive multi-table joins and historical Window `LAG` functions to calculate distance and KMPL. |
+| **Job 5** | `gold_fleet_snapshot` | 🥈 → 🥇 | Filters SCD2 for active assets to generate management overviews. |
+| **Job 6** | `gold_safety_summary` | 🥈 → 🥇 | Aggregates daily streaming violations into executive compliance KPIs. |
+| **Job 7** | `yearly_maintenance` | 🥉 → 🥈 | **Yearly DAG**: Loads predictive maintenance logs, partitioned strictly by execution year. |
+| **Job 8** | `monthly_cooldown` | 🥈 → 🥇 | **Monthly DAG**: Generates HR deduction reports and implements immutable driver rollover logic. |
 
 ---
 
-## ⚖️ Business Rules & Safety Logic
+## 🌬️ Advanced Airflow Orchestration
 
-### 🚫 Safety Strikes
-- **Speed Violation**: 1 Strike per detected event.
-- **Geofence Violation**: 1 Strike per entry into a restricted zone.
-- **Suspension**: Reaching **10 Strikes** automatically changes status to `SUSPENDED` and freezes the driver's `current_rate`.
+OmniRoute features an enterprise-grade Airflow orchestration layer designed to never fail silently.
 
-### ❄️ Monthly Cooldown (Job 8)
-Executed on the 1st of every month:
-- **Active Drivers (< 10 strikes)**: Strikes reset to `0`. `current_rate` restored to `base_rate`.
-- **Suspended Drivers (>= 10 strikes)**: No cooldown. Status and strikes are carried forward to the new month partition.
-- **Immutable History**: Instead of updating rows, Job 8 creates a **New Partition**. This ensures we have a permanent record of every driver's performance for every month in history.
+1.  **Cross-DAG Dependencies**: `DAG 2` (Fuel/Safety) utilizes `ExternalTaskSensor` to wait up to 90 minutes for `DAG 1` (Dims) to successfully build daily dimensions before executing.
+2.  **Graceful Degradation & Fallbacks**: If upstream S3 files fail to arrive, `BranchPythonOperator` checks S3 for historical snapshots. If prior data exists, the pipeline safely processes using "Yesterday's" data. If no historical data exists, the branch triggers a strict `Skip DAG` failsafe to prevent empty-join corruption.
+3.  **Convergence Gates**: Advanced task branching utilizes `EmptyOperator` convergence gates with `all_success` rules to prevent Cross-Branch Trigger Rule Contamination, ensuring downstream Spark jobs never crash due to missing paths.
 
 ---
 
-## ⚙️ Setup & Deployment
+## ⚡ Real-Time Streaming Engine
 
-1. **Infrastructure**:
-   - Create S3 buckets: `bronze`, `silver`, `gold`.
-   - Setup EMR cluster with `delta-spark` and `postgresql` packages.
-   - Provision PostgreSQL RDS with the schemas provided in `database/schema.sql`.
-
-2. **Deployment**:
-   - Upload all scripts in `glue_jobs/` to your Glue Script S3 path.
-   - Deploy Airflow DAGs to your `dags/` folder.
-   - Start the `processor.py` on EMR using `spark-submit --packages io.delta:delta-core_2.12:2.3.0,org.postgresql:postgresql:42.5.0`.
+The `processor.py` engine consumes Kafka streams at 1-second intervals using Spark Structured Streaming:
+1.  **Violation Detection**: Spatial joins (Geofence breaches) and threshold logic (Speeding).
+2.  **Circuit Breaker**: Dynamically checks PostgreSQL to instantly ignore telemetry from `SUSPENDED` drivers.
+3.  **Atomic Syncs**: Uses the **Staging Table Pattern** (`TRUNCATE` staging → `JDBC WRITE` → `UPSERT` target) to ensure Postgres dashboards never reflect partially written or corrupt data.
 
 ---
 
-## 📊 Monitoring
-- **Logs**: CloudWatch Logs for Glue Jobs.
-- **Metrics**: Airflow UI for pipeline health.
-- **Data Quality**: Check the `rejects/` prefix in S3 for rows that failed the Data Firewall checks.
+## ⚖️ Business Logic: Monthly Cooldowns
 
----
+Executed via Job 8 on the 1st of every month:
+*   **Active Drivers (< 10 strikes)**: Strikes reset to `0`. `current_rate` restored to `base_rate`.
+*   **Suspended Drivers (>= 10 strikes)**: No cooldown. Status and strikes are carried forward.
+*   **Immutable Auditing**: History is **never overwritten**. Job 8 uses `MERGE` to create brand new monthly partitions, ensuring HR can historically query any driver's status for any month in the past.
 
 > **OmniRoute** — *Safety First, Efficiency Always.* 🚛💨
