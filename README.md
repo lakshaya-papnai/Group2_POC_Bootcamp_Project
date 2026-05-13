@@ -87,7 +87,7 @@
 | **Table Format** | Delta Lake | ACID transactions, time travel, MERGE |
 | **Orchestration** | Apache Airflow (EC2) | DAG scheduling, sensors, branching |
 | **Reporting DB** | PostgreSQL (EC2) | Gold layer for Power BI |
-| **Dashboards** | Microsoft Power BI | Executive & operational reporting |
+| **Dashboards** | Metabase | Executive & operational reporting |
 
 **Why Delta Lake over raw Parquet?** Delta provides ACID transactions (no partial writes), schema enforcement, and the MERGE command required for SCD2 updates. Without Delta, the SCD2 engine in Job 2 and the streaming processor would need complex custom logic to handle concurrent reads/writes.
 
