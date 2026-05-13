@@ -91,7 +91,7 @@
 
 **Why Delta Lake over raw Parquet?** Delta provides ACID transactions (no partial writes), schema enforcement, and the MERGE command required for SCD2 updates. Without Delta, the SCD2 engine in Job 2 and the streaming processor would need complex custom logic to handle concurrent reads/writes.
 
-**Why PostgreSQL instead of querying S3 directly?** Power BI performs best with a relational backend for live dashboards. S3 + Delta is optimized for batch analytics, not low-latency BI queries. PostgreSQL acts as a serving layer that is refreshed via idempotent upserts after every batch/streaming run.
+**Why PostgreSQL instead of querying S3 directly?** BI Tools performs best with a relational backend for live dashboards. S3 + Delta is optimized for batch analytics, not low-latency BI queries. PostgreSQL acts as a serving layer that is refreshed via idempotent upserts after every batch/streaming run.
 
 ---
 
