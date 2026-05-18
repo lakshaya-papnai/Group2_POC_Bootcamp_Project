@@ -21,8 +21,8 @@ try:
 except ImportError:
     from airflow.operators.dummy import DummyOperator as EmptyOperator
 
-SILVER_BUCKET   = "ttn-de-bootcamp-silver-us-east-1"
-SILVER_BASE     = "poc-bootcamp-grp2-silver"
+SILVER_BUCKET   = Variable.get("SILVER_BUCKET", default_var="ttn-de-bootcamp-silver-us-east-1")
+SILVER_BASE     = Variable.get("SILVER_PREFIX",  default_var="poc-bootcamp-grp2-silver")
 DIM_VEHICLE_PREFIX  = f"{SILVER_BASE}/dim_vehicle/_delta_log/"
 SCD2_PREFIX         = f"{SILVER_BASE}/dim_asset_history_scd2/_delta_log/"
 SAFETY_VIO_PREFIX   = f"{SILVER_BASE}/fact_safety_violations/_delta_log/"
@@ -62,8 +62,9 @@ PG_USER     = Variable.get("PG_USER",     default_var="fleet_user")
 PG_PASS     = Variable.get("PG_PASS")
 AWS_CONN_ID = Variable.get("AWS_CONN_ID", default_var="aws_default")
 
-BRONZE_BUCKET = "ttn-de-bootcamp-bronze-us-east-1"
-BASE_PREFIX   = "poc-bootcamp-grp2-bronze/raw"
+BRONZE_BUCKET = Variable.get("BRONZE_BUCKET", default_var="ttn-de-bootcamp-bronze-us-east-1")
+BRONZE_PREFIX = Variable.get("BRONZE_PREFIX",  default_var="poc-bootcamp-grp2-bronze")
+BASE_PREFIX   = f"{BRONZE_PREFIX}/raw"
 
 REGISTRY_KEY   = f"{BASE_PREFIX}/vehicle_registry/vehicle_registry.csv"
 ASSIGNMENT_KEY = f"{BASE_PREFIX}/vehicle_assignment/vehicle_assignment*.csv"
@@ -78,7 +79,7 @@ GLUE_JOB_6 = "job6_safety_summary"
 
 GLUE_COMMON_ARGS = {
     "--datalake-formats":          "delta",
-    "--additional-python-modules": "psycopg2-binary",
+    "--additional-python-modules": "psycopg2-binary,python-dotenv",
     "--enable-glue-datacatalog":   "true",
     "--enable-spark-ui":           "true",
     "--enable-job-insights":       "true",
