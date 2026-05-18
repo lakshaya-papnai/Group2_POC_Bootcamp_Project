@@ -4,11 +4,22 @@ Streaming Job 1: Kafka Ingestor (Kafka → Bronze S3)
 PURPOSE:
   This job is an ultra-lightweight Kafka consumer whose ONLY job is to persist
   raw telemetry messages to S3 Bronze as JSON. It contains ZERO business logic —
-  no joins, no deduplication, no database writes.  
+  no joins, no deduplication, no database writes.
 """
 
 import argparse
 import logging
+import os
+import traceback
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # On AWS EMR, environment variables are injected at cluster/step level
+
+from config import cfg
+
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import (
     StructType, StructField, StringType, DoubleType
@@ -47,12 +58,12 @@ def main():
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    
-    bronze_path = "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-grp2-bronze/raw/telemetry_stream"
-    checkpoint  = "s3://ttn-de-bootcamp-bronze-us-east-1/8834_Lakshaya_bronze/checkpoints/ingestor/"
+    # S3 paths from config.py / .env
+    bronze_path = cfg.TELEMETRY_BRONZE_PATH
+    checkpoint  = cfg.INGESTOR_CHECKPOINT
 
-     # startingOffsets = "latest": only consume NEW messages from this point forward.
-      raw = (
+    # startingOffsets = "latest": only consume NEW messages from this point forward.
+    raw = (
         spark.readStream
         .format("kafka")
         .option("kafka.bootstrap.servers", args.brokers)
@@ -75,7 +86,7 @@ def main():
                 F.col("_kafka_ts")
             ).alias("event_timestamp")
         )
-        # Add ingestion_date for partitioning 
+        # Add ingestion_date for partitioning
         .withColumn("ingestion_date", F.to_date(F.current_timestamp()).cast("string"))
     )
 
@@ -91,8 +102,18 @@ def main():
     )
 
     log.info("Ingestor started — consuming Kafka → Bronze S3")
-    query.awaitTermination()
+    try:
+        query.awaitTermination()
+    except Exception as e:
+        log.error(f"[ingestor] Streaming query terminated with error: {e}")
+        log.error(traceback.format_exc())
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        log.error(f"INGESTOR FAILED: {e}")
+        log.error(traceback.format_exc())
+        raise
