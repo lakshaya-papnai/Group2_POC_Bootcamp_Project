@@ -1,8 +1,16 @@
 import argparse
 import sys
+import os
+import traceback
 import boto3
 import psycopg2
 import re
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # On AWS Glue, environment variables are injected as Job Parameters
+from config import cfg
 
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
@@ -12,6 +20,8 @@ from pyspark.sql.functions import (
 from pyspark.sql.types import *
 from pyspark.sql.window import Window
 from delta.tables import DeltaTable
+from utils import execute_postgres_upsert
+
 
 # -------------------------------
 # PARAMETERS
@@ -41,18 +51,29 @@ spark = SparkSession.builder \
 spark.sparkContext.setLogLevel("WARN")
 
 # -------------------------------
-# S3 CONFIG
+# S3 CONFIG  (from config.py / .env)
 # -------------------------------
-BUCKET = "ttn-de-bootcamp-bronze-us-east-1"
-BASE   = "poc-bootcamp-grp2-bronze"
+BUCKET         = cfg.BRONZE_BUCKET
 
-RAW_PREFIX     = f"{BASE}/raw/vehicle_assignment/"
-PROCESSED_BASE = f"s3://{BUCKET}/{BASE}/processed/vehicle_assignment"
+RAW_PREFIX     = cfg.RAW_VEHICLE_ASSIGNMENT_PFX
+PROCESSED_BASE = cfg.PROCESSED_VEHICLE_ASSIGNMENT_PATH
 
-SILVER_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_asset_history_scd2"
-DIM_VEHICLE_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_vehicle"
+SILVER_PATH      = cfg.SCD2_PATH
+DIM_VEHICLE_PATH  = cfg.DIM_VEHICLE_PATH
 
 s3 = boto3.client("s3")
+
+def verified_delete(raw_key: str, processed_prefix: str) -> None:
+    """Delete raw_key ONLY after confirming processed_prefix has at least one file."""
+    response = s3.list_objects_v2(Bucket=BUCKET, Prefix=processed_prefix, MaxKeys=1)
+    if response.get("KeyCount", 0) == 0:
+        raise RuntimeError(
+            f"SAFETY CHECK FAILED: processed prefix '{processed_prefix}' is empty. "
+            f"Refusing to delete raw key '{raw_key}'. Investigate the Spark write."
+        )
+    print(f"Verified: processed data exists at s3://{BUCKET}/{processed_prefix}")
+    s3.delete_object(Bucket=BUCKET, Key=raw_key)
+    print(f"RAW file deleted: {raw_key}")
 
 # -------------------------------
 # POSTGRES CONFIG (from Glue Job params)
@@ -133,7 +154,10 @@ def filter_suspended_drivers(df):
         print("Suspended-driver filter applied from Postgres.")
         return result
     except Exception as e:
+        import traceback
         print(f"Skipping Postgres validation (will retry next run): {e}")
+        print("Detailed Error Traceback:")
+        print(traceback.format_exc())
         return df
 
 # -----------------------------------------------------------------
@@ -147,7 +171,7 @@ def ingest_file(key):
     file_name = key.split("/")[-1]
     print(f"Processing file: {file_name}")
 
-    raw_df    = spark.read.option("header", True).schema(schema).csv(path)
+    raw_df    = spark.read.option("header", True).option("delimiter", "\x01").schema(schema).csv(path)
 
     # ── DATA CLEANING ──────────────────────────────────────────────
     df = raw_df.filter(
@@ -163,7 +187,7 @@ def ingest_file(key):
         df = df.join(dim_vehicle_df, on="vin", how="inner")
         print("Applied VIN validation from dim_vehicle.")
     else:
-        print("⚠️ dim_vehicle not found. Skipping VIN validation.")
+        print("WARNING: dim_vehicle not found. Skipping VIN validation.")
 
     clean_count = df.count()
     print(f"Rows after cleaning & validation:  {clean_count}")
@@ -221,7 +245,7 @@ def ingest_file(key):
     )
 
     output_path = f"{PROCESSED_BASE}/ingestion_date={INGESTION_DATE}/{file_name}"
-    df.write.mode("overwrite").option("header", True).csv(output_path)
+    df.write.mode("overwrite").option("header", True).option("delimiter", "\x01").csv(output_path)
  
     return df
 
@@ -391,16 +415,11 @@ def write_to_postgres_gold():
         )
     )
 
-    # ── Stage into temp table ────────────────────────────────────────────
-    gold_df.write.jdbc(
-        url=JDBC_URL,
-        table="gold.asset_history_scd2_stg",
-        mode="overwrite",
-        properties={**DB_PROPERTIES, "truncate": "true"}
-    )
-    print(f" Staged rows into asset_history_scd2_stg")
+    jdbc_url = JDBC_URL
+    props    = DB_PROPERTIES
+    staging_table = "gold.asset_history_scd2_stg"
+    target_table  = "gold.asset_history_scd2"
 
-    # ── UPSERT: stg → main (PK: vin, start_date) ────────────────────────
     upsert_sql = """
         INSERT INTO gold.asset_history_scd2
             (vin, driver_id, start_date, end_date, daily_rate,
@@ -419,23 +438,23 @@ def write_to_postgres_gold():
         TRUNCATE gold.asset_history_scd2_stg;
     """
 
-    conn = psycopg2.connect(
-        host=args.db_host, database=args.db_name,
-        user=args.db_user, password=args.db_password,
-        connect_timeout=15
+    pg_connect_kwargs = {
+        "host":            args.db_host,
+        "database":        args.db_name,
+        "user":            args.db_user,
+        "password":        args.db_password,
+        "connect_timeout": 15
+    }
+
+    execute_postgres_upsert(
+        df=gold_df,
+        jdbc_url=jdbc_url,
+        staging_table=staging_table,
+        upsert_sql=upsert_sql,
+        pg_connect_kwargs=pg_connect_kwargs,
+        jdbc_props=props
     )
-    try:
-        cur = conn.cursor()
-        cur.execute(upsert_sql)
-        conn.commit()
-        print(f"gold.asset_history_scd2 upserted: {cur.rowcount} rows affected")
-        cur.close()
-    except Exception as e:
-        conn.rollback()
-        print(f"Postgres gold write failed: {e}")
-        raise
-    finally:
-        conn.close()
+    print("gold.asset_history_scd2 upsert complete.")
 
 
 # -------------------------------
@@ -465,9 +484,14 @@ if __name__ == "__main__":
             else:
                 apply_scd2(df)
 
-            # Atomic S3 delete: only after the merge succeeds
-            print(f"uccess! Deleting from raw: {file}")
-            s3.delete_object(Bucket=BUCKET, Key=file)
+            # Verified S3 delete: confirm processed partition exists before removing raw
+            file_name = file.split("/")[-1]
+            processed_prefix = (
+                PROCESSED_BASE.replace(f"s3://{BUCKET}/", "")
+                + f"/ingestion_date={INGESTION_DATE}/{file_name}"
+            )
+            print(f"Success! Deleting from raw: {file}")
+            verified_delete(file, processed_prefix)
 
        
         # Gold Postgres write (runs once after all files are processed)
@@ -475,5 +499,8 @@ if __name__ == "__main__":
 
 
     except Exception as e:
+        import traceback
         print(f"FAILED: {e}")
+        print("Detailed Error Traceback:")
+        print(traceback.format_exc())
         raise
