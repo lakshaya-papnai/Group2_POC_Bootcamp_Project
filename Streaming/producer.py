@@ -3,6 +3,12 @@ import json
 import time
 import argparse
 import os
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # On EC2/EMR, environment variables are injected at the OS/cluster level
+from config import cfg
 from datetime import datetime, timezone
 
 try:
@@ -11,8 +17,9 @@ try:
 except ImportError:
     raise SystemExit("kafka-python not installed. Run: pip install kafka-python")
 
-TOPIC = "telemetry_stream"
-DATA_FILE = "data/telemetry_messages.json"
+# Loaded from config.py / .env
+TOPIC     = cfg.KAFKA_TOPIC
+DATA_FILE = cfg.PRODUCER_DATA_FILE
 
 import logging 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -74,15 +81,15 @@ def run_stream(producer: KafkaProducer, events: list, rate: float):
                     publish_event(producer, fresh_event)
                     count += 1
                     if count % 10 == 0:
-                        log.info(f"📡 Sent [VIN: {fresh_event.get('vin')}] Speed: {fresh_event.get('speed')} km/h")
+                        log.info(f" Sent [VIN: {fresh_event.get('vin')}] Speed: {fresh_event.get('speed')} km/h")
                 except KafkaError as e:
                     log.error(f"Publish error: {e}")
                 time.sleep(delay)
-            log.warning("🔄 Reached end of static file. Looping back to the beginning...")
+            log.warning(" Reached end of static file. Looping back to the beginning...")
     except KeyboardInterrupt:
         log.info(" Keyboard interrupt received.")
     finally:
-        log.info(f"🧹 Flushing buffer... Total published in this session: {count:,}")
+        log.info(f" Flushing buffer... Total published in this session: {count:,}")
         producer.flush()
 
 def main():
