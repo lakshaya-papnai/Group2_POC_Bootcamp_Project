@@ -20,6 +20,8 @@ except ImportError:
 AWS_CONN_ID    = Variable.get("AWS_CONN_ID",    default_var="aws_default")
 BRONZE_BUCKET  = Variable.get("BRONZE_BUCKET",  default_var="ttn-de-bootcamp-bronze-us-east-1")
 BRONZE_PREFIX  = Variable.get("BRONZE_PREFIX",  default_var="poc-bootcamp-grp2-bronze")
+GLUE_SCRIPTS_BUCKET = Variable.get("GLUE_SCRIPTS_BUCKET", default_var="ttn-de-bootcamp-scripts-us-east-1")
+GLUE_SCRIPTS_PREFIX = Variable.get("GLUE_SCRIPTS_PREFIX", default_var="glue_jobs")
 
 MAINTENANCE_S3_KEY = f"{BRONZE_PREFIX}/raw/maintenance_logs/maintenance_schedules.csv"
 
@@ -28,6 +30,9 @@ GLUE_JOB_7 = "job7_yearly_maintenance_load"
 GLUE_COMMON_ARGS = {
     "--datalake-formats":          "delta",
     "--additional-python-modules": "psycopg2-binary,python-dotenv",
+    # config.py and utils.py are library files, NOT separate jobs.
+    # Glue adds them to the Python path automatically at job startup.
+    "--extra-py-files":            f"s3://{GLUE_SCRIPTS_BUCKET}/{GLUE_SCRIPTS_PREFIX}/config.py,s3://{GLUE_SCRIPTS_BUCKET}/{GLUE_SCRIPTS_PREFIX}/utils.py",
     "--enable-glue-datacatalog":   "true",
     "--enable-spark-ui":           "true",
     "--enable-job-insights":       "true",
