@@ -1,6 +1,13 @@
 import argparse
 import sys
+import os
 import boto3
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # On AWS Glue, environment variables are injected as Job Parameters
+from config import cfg
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, current_timestamp, lit, trim, length, 
@@ -34,20 +41,28 @@ spark = SparkSession.builder \
 spark.sparkContext.setLogLevel("WARN")
 
 # -------------------------------
-# S3 CONFIG
+# S3 CONFIG  (from config.py / .env)
 # -------------------------------
-BUCKET = "ttn-de-bootcamp-bronze-us-east-1"
-BASE = "poc-bootcamp-grp2-bronze"
+BUCKET         = cfg.BRONZE_BUCKET
+RAW_KEY        = cfg.RAW_FUEL_TRANSACTIONS_KEY
 
-RAW_KEY = f"{BASE}/raw/fuel_transactions/fuel_transactions.csv"
-RAW_PATH = f"s3://{BUCKET}/{RAW_KEY}"
-
-PROCESSED_PATH = f"s3://{BUCKET}/{BASE}/processed/fuel_receipts"
-
-SILVER_BASE    = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver"
-FACT_FUEL_PATH = f"{SILVER_BASE}/fact_fuel_transactions"
+RAW_PATH        = cfg.RAW_FUEL_TRANSACTIONS_PATH
+PROCESSED_PATH  = cfg.PROCESSED_FUEL_RECEIPTS_PATH
+FACT_FUEL_PATH  = cfg.FACT_FUEL_PATH
 
 s3 = boto3.client("s3")
+
+def verified_delete(raw_key: str, processed_prefix: str) -> None:
+    """Delete raw_key ONLY after confirming processed_prefix has at least one file."""
+    response = s3.list_objects_v2(Bucket=BUCKET, Prefix=processed_prefix, MaxKeys=1)
+    if response.get("KeyCount", 0) == 0:
+        raise RuntimeError(
+            f"SAFETY CHECK FAILED: processed prefix '{processed_prefix}' is empty. "
+            f"Refusing to delete raw key '{raw_key}'. Investigate the Spark write."
+        )
+    print(f"Verified: processed data exists at s3://{BUCKET}/{processed_prefix}")
+    s3.delete_object(Bucket=BUCKET, Key=raw_key)
+    print(f"RAW file deleted: {raw_key}")
 
 # -------------------------------
 # 1. INGEST RAW → PROCESSED 
@@ -63,7 +78,7 @@ def ingest_fuel_receipts():
         StructField("timestamp", StringType(), True)
     ])
 
-    df = spark.read.option("header", True).schema(schema).csv(RAW_PATH)
+    df = spark.read.option("header", True).option("delimiter", "\x01").schema(schema).csv(RAW_PATH)
 
     clean_df = df.filter(
         # String checks
@@ -83,7 +98,7 @@ def ingest_fuel_receipts():
     clean_df.write \
         .mode("overwrite") \
         .partitionBy("ingestion_date") \
-        .option("header", True) \
+        .option("delimiter", "\x01") \
         .csv(PROCESSED_PATH)
         
     return True
@@ -95,7 +110,7 @@ def build_fact_fuel():
     print(f" Reading processed fuel receipts for {INGESTION_DATE}")
 
     path = f"{PROCESSED_PATH}/ingestion_date={INGESTION_DATE}/"
-    df = spark.read.option("header", True).csv(path)
+    df = spark.read.option("header", True).option("delimiter", "\x01").csv(path)
 
     if df.rdd.isEmpty():
         raise Exception("Processed fuel receipts missing")
@@ -142,9 +157,13 @@ if __name__ == "__main__":
         has_data = ingest_fuel_receipts()
         
         if has_data:
-            build_fact_fuel()                   
-            s3.delete_object(Bucket=BUCKET, Key=RAW_KEY)
+            build_fact_fuel()
+            processed_s3_prefix = PROCESSED_PATH.replace(f"s3://{BUCKET}/", "") + f"/ingestion_date={INGESTION_DATE}/"
+            verified_delete(RAW_KEY, processed_s3_prefix)
  
     except Exception as e:
+        import traceback
         print(f"FAILED: {e}")
+        print("Detailed Error Traceback:")
+        print(traceback.format_exc())
         raise
