@@ -21,9 +21,17 @@ This job performs three operations IN ORDER:
 """
 
 import argparse
+import os
 import boto3
 import psycopg2
 from datetime import datetime, timedelta
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # On AWS Glue, environment variables are injected as Job Parameters
+from config import cfg
+from utils import execute_postgres_upsert
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
@@ -49,11 +57,11 @@ exec_dt      = datetime.strptime(EXECUTION_DATE, "%Y-%m-%d")
 prev_month   = (exec_dt - timedelta(days=1)).strftime("%Y-%m")   # e.g., "2026-05"
 new_month    = exec_dt.strftime("%Y-%m")                         # e.g., "2026-06"
 
-# S3 Paths
-GOLD_DELTA_PATH = "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-grp2-gold/driver_safety_status"
-SCD2_PATH       = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_asset_history_scd2"
-GOLD_BUCKET     = "ttn-de-bootcamp-gold-us-east-1"
-REPORT_PREFIX   = "poc-bootcamp-grp2-gold/fleet_reports"
+# S3 Paths  (from config.py / .env)
+GOLD_DELTA_PATH = cfg.GOLD_DRIVER_SAFETY_STATUS_PATH
+SCD2_PATH       = cfg.SCD2_PATH
+GOLD_BUCKET     = cfg.GOLD_BUCKET
+REPORT_PREFIX   = cfg.GOLD_REPORT_PREFIX
 
 # Postgres
 JDBC_URL = f"jdbc:postgresql://{args.db_host}:{args.db_port}/{args.db_name}"
@@ -81,20 +89,6 @@ def sync_to_postgres(df):
     pg_df = df.select("driver_id", "base_rate", "strike_count",
                       "current_adjusted_rate", "status", "month")
 
-    # Step 1: Truncate staging
-    conn = psycopg2.connect(**PG_CONNECT, connect_timeout=15)
-    try:
-        cur = conn.cursor()
-        cur.execute(f"TRUNCATE TABLE {stg_table};")
-        conn.commit()
-        cur.close()
-    finally:
-        conn.close()
-
-    # Step 2: Spark JDBC write to staging
-    pg_df.write.mode("append").jdbc(url=JDBC_URL, table=stg_table, properties=JDBC_PROPS)
-
-    # Step 3: Upsert staging → target
     upsert_sql = f"""
     INSERT INTO {tgt_table}
         (driver_id, base_rate, strike_count, current_adjusted_rate, status, month)
@@ -109,19 +103,17 @@ def sync_to_postgres(df):
         updated_at            = NOW();
     """
 
-    conn = psycopg2.connect(**PG_CONNECT, connect_timeout=15)
-    try:
-        cur = conn.cursor()
-        cur.execute(upsert_sql)
-        conn.commit()
-        print(f"Postgres UPSERT complete — {tgt_table}")
-        cur.close()
-    except Exception as e:
-        conn.rollback()
-        print(f"Postgres UPSERT failed: {e}")
-        raise
-    finally:
-        conn.close()
+    pg_connect_kwargs = PG_CONNECT.copy()
+    pg_connect_kwargs["connect_timeout"] = 15
+
+    execute_postgres_upsert(
+        df=pg_df,
+        jdbc_url=JDBC_URL,
+        staging_table=stg_table,
+        upsert_sql=upsert_sql,
+        pg_connect_kwargs=pg_connect_kwargs,
+        jdbc_props=JDBC_PROPS
+    )
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -195,10 +187,17 @@ def generate_report(report_df):
     report_text = "\n".join(lines)
 
     s3 = boto3.client("s3")
-    s3.put_object(Bucket=GOLD_BUCKET, Key=s3_key,
-                  Body=report_text.encode("utf-8"), ContentType="text/plain")
-    print(f"Report uploaded → s3://{GOLD_BUCKET}/{s3_key}")
-    print(f"\nREPORT PREVIEW:\n{report_text[:800]}")
+    try:
+        s3.put_object(Bucket=GOLD_BUCKET, Key=s3_key,
+                      Body=report_text.encode("utf-8"), ContentType="text/plain")
+        print(f"Report uploaded → s3://{GOLD_BUCKET}/{s3_key}")
+        print(f"\nREPORT PREVIEW:\n{report_text[:800]}")
+    except Exception as e:
+        import traceback
+        print(f"[generate_report] S3 upload failed for key '{s3_key}': {e}")
+        print("Detailed Error Traceback:")
+        print(traceback.format_exc())
+        raise RuntimeError(f"Failed to upload monthly report to S3: {e}") from e
 
 
 def main():
@@ -225,7 +224,7 @@ def main():
 
         if prev_gold_df.count() > 0:
             has_prev_data = True
-            print(f"📖 Found {prev_gold_df.count()} driver(s) in Gold for {prev_month}.")
+            print(f"Found {prev_gold_df.count()} driver(s) in Gold for {prev_month}.")
             
     if not has_prev_data:
         print(f"No previous month data found for {prev_month}. Skipping report generation and cooldown/rollover.")
@@ -240,7 +239,7 @@ def main():
         .groupBy("driver_id")
         .agg(F.max("rate").alias("scd2_base_rate"))
     )
-    print(f"📖 Found {scd2_df.count()} active driver(s) in SCD2.")
+    print(f"Found {scd2_df.count()} active driver(s) in SCD2.")
 
     # GENERATE REPORT 
     # FULL OUTER JOIN: Gold (prev month) ⟷ SCD2 (active fleet)
@@ -272,7 +271,7 @@ def main():
     generate_report(report_df)
 
     # ROLLOVER — CREATE NEW MONTH ROWS
-    print(f"🔄 Creating rollover rows for {new_month}...")
+    print(f" Creating rollover rows for {new_month}...")
 
     # EXCEPTION PATTERN: Only rollover drivers who had violations last month.
     # ACTIVE drivers (who had 1-9 strikes) reset to 0 strikes.
@@ -317,11 +316,16 @@ def main():
             .mode("overwrite").partitionBy("month") \
             .save(GOLD_DELTA_PATH)
 
-
     # SYNC TO POSTGRES
     sync_to_postgres(rollover_df)
     spark.stop()
 
-
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"JOB 8 FAILED: {e}")
+        print("Detailed Error Traceback:")
+        print(traceback.format_exc())
+        raise
