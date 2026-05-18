@@ -1,6 +1,13 @@
 import argparse
 import sys
+import os
 import boto3
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # On AWS Glue, environment variables are injected as Job Parameters
+from config import cfg
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, dayofweek, current_timestamp, lit, 
@@ -33,22 +40,32 @@ spark = SparkSession.builder \
 spark.sparkContext.setLogLevel("WARN")
 
 # -------------------------------
-# S3 CONFIG
+# S3 CONFIG  (from config.py / .env)
 # -------------------------------
-BUCKET = "ttn-de-bootcamp-bronze-us-east-1"
-BASE = "poc-bootcamp-grp2-bronze"
-RAW_KEY = f"{BASE}/raw/vehicle_registry/vehicle_registry.csv" 
+BUCKET         = cfg.BRONZE_BUCKET
+RAW_KEY        = cfg.RAW_VEHICLE_REGISTRY_KEY
 
-RAW_PATH = f"s3://{BUCKET}/{RAW_KEY}"
-PROCESSED_PATH = f"s3://{BUCKET}/{BASE}/processed/vehicle_registry"
-ZONES_PATH = f"s3://{BUCKET}/{BASE}/raw/restricted_zones/restricted_zones.json"
+RAW_PATH        = cfg.RAW_VEHICLE_REGISTRY_PATH
+PROCESSED_PATH  = cfg.PROCESSED_VEHICLE_REGISTRY_PATH
+ZONES_PATH      = f"{cfg.BRONZE_BASE}/raw/restricted_zones/restricted_zones.json"
 
-SILVER_BASE      = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver"
-DIM_VEHICLE_PATH = f"{SILVER_BASE}/dim_vehicle"
-DIM_ZONES_PATH   = f"{SILVER_BASE}/dim_restricted_zones"
-DIM_DATE_PATH    = f"{SILVER_BASE}/dim_date"
+DIM_VEHICLE_PATH = cfg.DIM_VEHICLE_PATH
+DIM_ZONES_PATH   = cfg.DIM_ZONES_PATH
+DIM_DATE_PATH    = cfg.DIM_DATE_PATH
 
 s3 = boto3.client("s3")
+
+def verified_delete(raw_key: str, processed_prefix: str) -> None:
+    """Delete raw_key ONLY after confirming processed_prefix has at least one file."""
+    response = s3.list_objects_v2(Bucket=BUCKET, Prefix=processed_prefix, MaxKeys=1)
+    if response.get("KeyCount", 0) == 0:
+        raise RuntimeError(
+            f"SAFETY CHECK FAILED: processed prefix '{processed_prefix}' is empty. "
+            f"Refusing to delete raw key '{raw_key}'. Investigate the Spark write."
+        )
+    print(f"Verified: processed data exists at s3://{BUCKET}/{processed_prefix}")
+    s3.delete_object(Bucket=BUCKET, Key=raw_key)
+    print(f"RAW file deleted: {raw_key}")
 
 # -------------------------------
 # 1. INGEST RAW → PROCESSED (VEHICLE )
@@ -64,7 +81,7 @@ def ingest_vehicle_registry():
         StructField("baseline_kmpl", DoubleType(), True)
     ])
 
-    df = spark.read.option("header", True).schema(schema).csv(RAW_PATH)
+    df = spark.read.option("header", True).option("delimiter", "\x01").schema(schema).csv(RAW_PATH)
 
     # ---------------------------------------------------------
     # CLEAN DATA CHECKING: VEHICLE REGISTRY
@@ -89,12 +106,13 @@ def ingest_vehicle_registry():
     clean_df.write \
         .mode("overwrite") \
         .partitionBy("ingestion_date") \
-        .option("header", True) \
+        .option("delimiter", "\x01") \
         .csv(PROCESSED_PATH)
 
     print("Cleaning RAW file...")
-    s3.delete_object(Bucket=BUCKET, Key=RAW_KEY)
-    print("RAW file deleted")
+    # PROCESSED_PATH is s3://bucket/prefix/...  strip the s3://bucket/ to get the S3 key prefix
+    processed_s3_prefix = PROCESSED_PATH.replace(f"s3://{BUCKET}/", "") + f"/ingestion_date={INGESTION_DATE}/"
+    verified_delete(RAW_KEY, processed_s3_prefix)
 
 # -------------------------------
 # 2. DIM VEHICLE (BRONZE PROCESSED -> SILVER DIM_VEHICLE)
@@ -104,9 +122,13 @@ def load_dim_vehicle():
     print(f"Reading processed partition {INGESTION_DATE}")
 
     try:
-        df = spark.read.option("header", True).csv(path)
-    except Exception:
-        print("No processed data found for today. Skipping dim_vehicle load.")
+        df = spark.read.option("header", True).option("delimiter", "\x01").csv(path)
+    except Exception as e:
+        import traceback
+        print(f"[load_dim_vehicle] Could not read processed partition '{path}': {e}")
+        print("Detailed Error Traceback:")
+        print(traceback.format_exc())
+        print("Skipping dim_vehicle load for this run.")
         return
 
     if df.rdd.isEmpty():
@@ -126,7 +148,7 @@ def load_dim_vehicle():
     df = df.withColumn("ingestion_timestamp", current_timestamp()) \
            .withColumn("source_partition", lit(INGESTION_DATE))
 
-    print("💾 Writing dim_vehicle to Silver...")
+    print("Writing dim_vehicle to Silver...")
     df.write.format("delta") \
         .mode("overwrite") \
         .option("overwriteSchema", "true") \
@@ -213,5 +235,8 @@ if __name__ == "__main__":
         print("JOB 1 SUCCESS")
 
     except Exception as e:
+        import traceback
         print(f"JOB 1 FAILED: {e}")
+        print("Detailed Error Traceback:")
+        print(traceback.format_exc())
         raise
