@@ -1,5 +1,14 @@
 import argparse
+import os
+import traceback
 import psycopg2
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # On AWS Glue, environment variables are injected as Job Parameters
+from config import cfg
+from utils import execute_postgres_upsert
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import (
     col, lag, when, lit, current_timestamp,
@@ -24,12 +33,13 @@ DB_NAME = args.db_name
 DB_USER = args.db_user
 DB_PASS = args.db_password
 
-SILVER_FUEL_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/fact_fuel_transactions"
-DIM_VEHICLE_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_vehicle"
-DIM_DATE_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_date"
-DIM_MAINTENANCE_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_maintenance_schedule"
+# S3 paths  (from config.py / .env)
+SILVER_FUEL_PATH     = cfg.FACT_FUEL_PATH
+DIM_VEHICLE_PATH     = cfg.DIM_VEHICLE_PATH
+DIM_DATE_PATH        = cfg.DIM_DATE_PATH
+DIM_MAINTENANCE_PATH = cfg.DIM_MAINTENANCE_PATH
 
-GOLD_PATH = "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-grp2-gold/fuel_efficiency_audit"
+GOLD_PATH = cfg.GOLD_FUEL_AUDIT_PATH
 
 def main():
 
@@ -166,7 +176,7 @@ def main():
         .save(GOLD_PATH)
  
     # ── WRITE POSTGRES (truncate → append → upsert) ─────────────────
-    print("📡 Writing to Postgres...")
+    print("Writing to Postgres...")
     jdbc_url = f"jdbc:postgresql://{DB_HOST}:5432/{DB_NAME}"
     props = {"user": DB_USER, "password": DB_PASS, "driver": "org.postgresql.Driver"}
     staging_table = "gold.fuel_efficiency_audit_stg"
@@ -187,37 +197,35 @@ def main():
         ingestion_timestamp = EXCLUDED.ingestion_timestamp;
     """
 
-    conn, cur = None, None
-    try:
-        # Step 1: TRUNCATE staging before Spark writes
-        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASS)
-        cur  = conn.cursor()
-        cur.execute(f"TRUNCATE TABLE {staging_table};")
-        conn.commit()
-        cur.close()
-        conn.close()
-        conn, cur = None, None
+    pg_connect_kwargs = {
+        "host": DB_HOST,
+        "database": DB_NAME,
+        "user": DB_USER,
+        "password": DB_PASS,
+        "connect_timeout": 15
+    }
 
-        # Step 2: Spark JDBC append into staging.
-        # ingestion_date is only an S3 partition key — Postgres tables don't have this column.
-        pg_df = final_df.drop("ingestion_date")
-        pg_df.write.mode("append").jdbc(url=jdbc_url, table=staging_table, properties=props)
+    # ingestion_date is only an S3 partition key — Postgres tables don't have this column.
+    pg_df = final_df.drop("ingestion_date")
 
-        # Step 3: UPSERT staging → target
-        conn = psycopg2.connect(host=DB_HOST, database=DB_NAME, user=DB_USER, password=DB_PASS)
-        cur  = conn.cursor()
-        cur.execute(upsert_sql)
-        conn.commit()
-
-    except Exception as e:
-        if conn: conn.rollback()
-        raise
-    finally:
-        if cur:  cur.close()
-        if conn: conn.close()
+    execute_postgres_upsert(
+        df=pg_df,
+        jdbc_url=jdbc_url,
+        staging_table=staging_table,
+        upsert_sql=upsert_sql,
+        pg_connect_kwargs=pg_connect_kwargs,
+        jdbc_props=props
+    )
 
     final_df.unpersist()   # release cached memory after both writes are done
     spark.stop()
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"JOB 4 FAILED: {e}")
+        print("Detailed Error Traceback:")
+        print(traceback.format_exc())
+        raise
