@@ -21,12 +21,17 @@ PG_DB       = Variable.get("PG_DB",       default_var="fleet_db")
 PG_USER     = Variable.get("PG_USER",     default_var="fleet_user")
 PG_PASS     = Variable.get("PG_PASS")
 AWS_CONN_ID = Variable.get("AWS_CONN_ID", default_var="aws_default")
+GLUE_SCRIPTS_BUCKET = Variable.get("GLUE_SCRIPTS_BUCKET", default_var="ttn-de-bootcamp-scripts-us-east-1")
+GLUE_SCRIPTS_PREFIX = Variable.get("GLUE_SCRIPTS_PREFIX", default_var="glue_jobs")
 
 GLUE_JOB_8 = "job8_monthly_cooldown"
 
 GLUE_COMMON_ARGS = {
     "--datalake-formats":          "delta",
     "--additional-python-modules": "psycopg2-binary,python-dotenv",
+    # config.py and utils.py are library files, NOT separate jobs.
+    # Glue adds them to the Python path automatically at job startup.
+    "--extra-py-files":            f"s3://{GLUE_SCRIPTS_BUCKET}/{GLUE_SCRIPTS_PREFIX}/config.py,s3://{GLUE_SCRIPTS_BUCKET}/{GLUE_SCRIPTS_PREFIX}/utils.py",
     "--enable-glue-datacatalog":   "true",
     "--enable-spark-ui":           "true",
     "--enable-job-insights":       "true",
