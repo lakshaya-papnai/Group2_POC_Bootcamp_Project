@@ -1,6 +1,13 @@
 import argparse
 import sys
+import os
 import boto3
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # On AWS Glue, environment variables are injected as Job Parameters
+from config import cfg
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, to_date, current_timestamp, lit, trim, length, row_number, desc
 from pyspark.sql.types import *
@@ -24,18 +31,27 @@ spark = SparkSession.builder \
 spark.sparkContext.setLogLevel("WARN")
 
 
-BUCKET = "ttn-de-bootcamp-bronze-us-east-1"
-BASE = "poc-bootcamp-grp2-bronze"
+# S3 CONFIG  (from config.py / .env)
+BUCKET               = cfg.BRONZE_BUCKET
+RAW_KEY              = cfg.RAW_MAINTENANCE_KEY
 
-RAW_KEY = f"{BASE}/raw/maintenance_logs/maintenance_schedules.csv"
-RAW_PATH = f"s3://{BUCKET}/{RAW_KEY}"
-
-PROCESSED_PATH = f"s3://{BUCKET}/{BASE}/processed/maintenance_logs"
-
-SILVER_BASE          = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver"
-DIM_MAINTENANCE_PATH = f"{SILVER_BASE}/dim_maintenance_schedule"
+RAW_PATH             = cfg.RAW_MAINTENANCE_PATH
+PROCESSED_PATH       = cfg.PROCESSED_MAINTENANCE_PATH
+DIM_MAINTENANCE_PATH = cfg.DIM_MAINTENANCE_PATH
 
 s3 = boto3.client("s3")
+
+def verified_delete(raw_key: str, processed_prefix: str) -> None:
+    """Delete raw_key ONLY after confirming processed_prefix has at least one file."""
+    response = s3.list_objects_v2(Bucket=BUCKET, Prefix=processed_prefix, MaxKeys=1)
+    if response.get("KeyCount", 0) == 0:
+        raise RuntimeError(
+            f"SAFETY CHECK FAILED: processed prefix '{processed_prefix}' is empty. "
+            f"Refusing to delete raw key '{raw_key}'. Investigate the Spark write."
+        )
+    print(f"Verified: processed data exists at s3://{BUCKET}/{processed_prefix}")
+    s3.delete_object(Bucket=BUCKET, Key=raw_key)
+    print(f"RAW file deleted: {raw_key}")
 
 # -------------------------------
 # 1. INGEST RAW → PROCESSED 
@@ -48,7 +64,7 @@ def ingest_maintenance_logs():
         StructField("service_type", StringType(), True)
     ])
 
-    df = spark.read.option("header", True).schema(schema).csv(RAW_PATH)
+    df = spark.read.option("header", True).option("delimiter", "\x01").schema(schema).csv(RAW_PATH)
 
     #  Missing & Whitespace checks
     clean_df = df.filter(
@@ -66,7 +82,7 @@ def ingest_maintenance_logs():
     clean_df.write \
         .mode("overwrite") \
         .partitionBy("ingestion_year") \
-        .option("header", True) \
+        .option("delimiter", "\x01") \
         .csv(PROCESSED_PATH)
         
     return True
@@ -77,7 +93,7 @@ def ingest_maintenance_logs():
 def build_dim_maintenance():
     
     path = f"{PROCESSED_PATH}/ingestion_year={INGESTION_YEAR}/"
-    df = spark.read.option("header", True).csv(path)
+    df = spark.read.option("header", True).option("delimiter", "\x01").csv(path)
 
     if df.rdd.isEmpty():
         raise Exception("Processed maintenance_logs missing")
@@ -111,8 +127,12 @@ if __name__ == "__main__":
         
         if has_data:
             build_dim_maintenance()
-            s3.delete_object(Bucket=BUCKET, Key=RAW_KEY)
+            processed_s3_prefix = PROCESSED_PATH.replace(f"s3://{BUCKET}/", "") + f"/ingestion_year={INGESTION_YEAR}/"
+            verified_delete(RAW_KEY, processed_s3_prefix)
 
     except Exception as e:
+        import traceback
         print(f"FAILED: {e}")
+        print("Detailed Error Traceback:")
+        print(traceback.format_exc())
         raise
