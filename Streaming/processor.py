@@ -11,7 +11,24 @@ PURPOSE:
 
 import argparse
 import logging
+import os
+import traceback
 import psycopg2
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # On AWS EMR, environment variables are injected at cluster/step level
+from config import cfg
+
+# On EMR with --py-files, utils.py is directly importable.
+# For local dev, fall back to relative path lookup.
+try:
+    from utils import execute_postgres_upsert
+except ImportError:
+    import sys
+    sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'glue_jobs'))
+    from utils import execute_postgres_upsert
 from pyspark.sql import SparkSession, functions as F
 from pyspark.sql.types import (
     StructType, StructField, StringType, IntegerType, DoubleType, TimestampType
@@ -36,17 +53,6 @@ def upsert_postgres(df, pg_conf):
     stg_table  = "gold.driver_safety_status_stg"
     tgt_table  = "gold.driver_safety_status"
 
-    conn, cur = None, None
-    try:
-        conn = psycopg2.connect(**pg_conf["connect"])
-        cur  = conn.cursor()
-        cur.execute(f"TRUNCATE TABLE {stg_table};")
-        conn.commit()
-    finally:
-        if cur:  cur.close()
-        if conn: conn.close()
-
-    df.write.mode("append").jdbc(url=jdbc_url, table=stg_table, properties=jdbc_props)
     upsert_sql = f"""
     INSERT INTO {tgt_table}
         (driver_id, base_rate, strike_count, current_adjusted_rate, status, month)
@@ -61,20 +67,14 @@ def upsert_postgres(df, pg_conf):
         updated_at            = NOW();
     """
 
-    conn, cur = None, None
-    try:
-        conn = psycopg2.connect(**pg_conf["connect"])
-        cur  = conn.cursor()
-        cur.execute(upsert_sql)
-        conn.commit()
-        log.info("Postgres UPSERT successful")
-    except Exception as e:
-        if conn: conn.rollback()
-        log.error(f"Postgres UPSERT failed: {e}")
-        raise
-    finally:
-        if cur:  cur.close()
-        if conn: conn.close()
+    execute_postgres_upsert(
+        df=df,
+        jdbc_url=jdbc_url,
+        staging_table=stg_table,
+        upsert_sql=upsert_sql,
+        pg_connect_kwargs=pg_conf["connect"],
+        jdbc_props=jdbc_props
+    )
 
 def upsert_gold_delta(spark, updates, gold_path, batch_id):
     if not DeltaTable.isDeltaTable(spark, gold_path):
@@ -158,12 +158,13 @@ def main():
     )
     spark.sparkContext.setLogLevel("WARN")
 
-    bronze_path = "s3://ttn-de-bootcamp-bronze-us-east-1/poc-bootcamp-grp2-bronze/raw/telemetry_stream"
-    silver_path = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/fact_safety_violations"
-    gold_path   = "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-grp2-gold/driver_safety_status"
-    scd2_path   = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_asset_history_scd2"
-    zones_path  = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_restricted_zones"
-    checkpoint  = "s3://ttn-de-bootcamp-bronze-us-east-1/8834_Lakshaya_bronze/checkpoints/processor_v2/"
+    # S3 paths from config.py / .env
+    bronze_path = cfg.TELEMETRY_BRONZE_PATH
+    silver_path = cfg.FACT_SAFETY_PATH
+    gold_path   = cfg.GOLD_DRIVER_SAFETY_STATUS_PATH
+    scd2_path   = cfg.SCD2_PATH
+    zones_path  = cfg.DIM_ZONES_PATH
+    checkpoint  = cfg.PROCESSOR_CHECKPOINT
 
     pg_conf = {
         "url":  f"jdbc:postgresql://{args.pg_host}:{args.pg_port}/{args.pg_db}",
@@ -183,141 +184,146 @@ def main():
     )
  
     def process_batch(batch_df, batch_id):
+        try:
+            if batch_df.rdd.isEmpty():
+                return
 
-        if batch_df.rdd.isEmpty():
-            return
-          
-        batch_df = batch_df.withColumn("speed", F.col("speed").cast("double"))
+            batch_df = batch_df.withColumn("speed", F.col("speed").cast("double"))
 
-        df = batch_df.filter(
-            F.col("vin").isNotNull() & (F.length(F.trim(F.col("vin"))) > 0) &
-            F.col("driver_id").isNotNull() & (F.length(F.trim(F.col("driver_id"))) > 0) &
-            F.col("speed").isNotNull() & (F.col("speed") >= 0) & (F.col("speed") <= 200) &
-            F.col("lat").isNotNull()  & (F.col("lat") >= -90.0)  & (F.col("lat") <= 90.0) &
-            F.col("long").isNotNull() & (F.col("long") >= -180.0) & (F.col("long") <= 180.0) &   
-            ~((F.col("lat") == 0.0) & (F.col("long") == 0.0)) &
-            F.col("event_timestamp").isNotNull()
-        )
-        if df.rdd.isEmpty():
-            return
+            df = batch_df.filter(
+                F.col("vin").isNotNull() & (F.length(F.trim(F.col("vin"))) > 0) &
+                F.col("driver_id").isNotNull() & (F.length(F.trim(F.col("driver_id"))) > 0) &
+                F.col("speed").isNotNull() & (F.col("speed") >= 0) & (F.col("speed") <= 200) &
+                F.col("lat").isNotNull()  & (F.col("lat") >= -90.0)  & (F.col("lat") <= 90.0) &
+                F.col("long").isNotNull() & (F.col("long") >= -180.0) & (F.col("long") <= 180.0) &
+                ~((F.col("lat") == 0.0) & (F.col("long") == 0.0)) &
+                F.col("event_timestamp").isNotNull()
+            )
+            if df.rdd.isEmpty():
+                return
 
-        active_assets = (
-            spark.read.format("delta").load(scd2_path)
-            .filter(F.col("status") == "IN-TRANSIT")
-            .groupBy("vin", "driver_id")
-            .agg(F.max("rate").alias("base_rate"))
-        )
+            active_assets = (
+                spark.read.format("delta").load(scd2_path)
+                .filter(F.col("status") == "IN-TRANSIT")
+                .groupBy("vin", "driver_id")
+                .agg(F.max("rate").alias("base_rate"))
+            )
 
-        df = df.join(
-            active_assets,
-            on=["vin", "driver_id"],
-            how="inner"    
-        )
-        if df.rdd.isEmpty():
-            log.info(f"Batch {batch_id}: no records matched active assets. Skipping.")
-            return
+            df = df.join(
+                active_assets,
+                on=["vin", "driver_id"],
+                how="inner"
+            )
+            if df.rdd.isEmpty():
+                log.info(f"Batch {batch_id}: no records matched active assets. Skipping.")
+                return
 
-        # VIOLATION DETECTION
-        # Speed threshold: 110 km/h
-        df = df.withColumn("speed_flag", F.col("speed") > 110)
+            # VIOLATION DETECTION
+            # Speed threshold: 110 km/h
+            df = df.withColumn("speed_flag", F.col("speed") > 110)
 
-        # Geofence check: join telemetry coordinates against restricted zone bounding boxes.
-        # "left" join ensures non-violating rows are preserved for the speed-only check.
-        df = df.join(
-            zones_df,
-            (df.lat  >= zones_df.min_lat)  & (df.lat  <= zones_df.max_lat) &
-            (df.long >= zones_df.min_long) & (df.long <= zones_df.max_long),
-            "left"
-        ).withColumn("zone_flag", F.col("zone_name").isNotNull())
+            # Geofence check: join telemetry coordinates against restricted zone bounding boxes.
+            # "left" join ensures non-violating rows are preserved for the speed-only check.
+            df = df.join(
+                zones_df,
+                (df.lat  >= zones_df.min_lat)  & (df.lat  <= zones_df.max_lat) &
+                (df.long >= zones_df.min_long) & (df.long <= zones_df.max_long),
+                "left"
+            ).withColumn("zone_flag", F.col("zone_name").isNotNull())
 
-        # Keep only rows that triggered at least one violation.
-        violations = df.filter(F.col("speed_flag") | F.col("zone_flag"))
-        if violations.rdd.isEmpty():
-            return
+            # Keep only rows that triggered at least one violation.
+            violations = df.filter(F.col("speed_flag") | F.col("zone_flag"))
+            if violations.rdd.isEmpty():
+                return
 
-        #  Bucket into 2-minute tumbling windows
-        violations = violations.withColumn(
-            "bucket_2m",
-            F.window(F.col("event_timestamp"), "2 minutes").getField("start")
-        )
+            # Bucket into 2-minute tumbling windows
+            violations = violations.withColumn(
+                "bucket_2m",
+                F.window(F.col("event_timestamp"), "2 minutes").getField("start")
+            )
 
-        bucket_w = Window.partitionBy("driver_id", "vin", "bucket_2m")
-        violations = violations.withColumn(
-            "window_speed_flag", F.max("speed_flag").over(bucket_w)
-        ).withColumn(
-            "window_zone_flag", F.max("zone_flag").over(bucket_w)
-        )
+            bucket_w = Window.partitionBy("driver_id", "vin", "bucket_2m")
+            violations = violations.withColumn(
+                "window_speed_flag", F.max("speed_flag").over(bucket_w)
+            ).withColumn(
+                "window_zone_flag", F.max("zone_flag").over(bucket_w)
+            )
 
-        violations = violations.withColumn(
-            "violation_type",
-            F.when(F.col("window_speed_flag") & F.col("window_zone_flag"), F.lit("SPEED_AND_GEOFENCE"))
-             .when(F.col("window_speed_flag"), F.lit("SPEED"))
-             .otherwise(F.lit("GEOFENCE"))
-        )
+            violations = violations.withColumn(
+                "violation_type",
+                F.when(F.col("window_speed_flag") & F.col("window_zone_flag"), F.lit("SPEED_AND_GEOFENCE"))
+                 .when(F.col("window_speed_flag"), F.lit("SPEED"))
+                 .otherwise(F.lit("GEOFENCE"))
+            )
 
-        #  Dedup — keep one row per (driver_id, vin, 2-min bucket)
-        dedup_w = Window.partitionBy("driver_id", "vin", "bucket_2m").orderBy(
-            F.col("speed_flag").desc(), "event_timestamp"
-        )
-        violations = (
-            violations
-            .withColumn("rn", F.row_number().over(dedup_w))
-            .filter(F.col("rn") == 1)
-            .drop("rn", "bucket_2m", "window_speed_flag", "window_zone_flag")
-        )
+            # Dedup — keep one row per (driver_id, vin, 2-min bucket)
+            dedup_w = Window.partitionBy("driver_id", "vin", "bucket_2m").orderBy(
+                F.col("speed_flag").desc(), "event_timestamp"
+            )
+            violations = (
+                violations
+                .withColumn("rn", F.row_number().over(dedup_w))
+                .filter(F.col("rn") == 1)
+                .drop("rn", "bucket_2m", "window_speed_flag", "window_zone_flag")
+            )
 
-        #SILVER WRITE  (fact_safety_violations)
-      
-        silver_df = violations.select(
-            "driver_id",
-            "vin",
-            "event_timestamp",
-            F.date_format("event_timestamp", "yyyy-MM").alias("month"),
-            "violation_type",
-            F.lit(1).cast("int").alias("strike_count"),
-            F.to_date(F.current_timestamp()).cast("string").alias("ingestion_date")
-        )
+            # SILVER WRITE (fact_safety_violations)
+            silver_df = violations.select(
+                "driver_id",
+                "vin",
+                "event_timestamp",
+                F.date_format("event_timestamp", "yyyy-MM").alias("month"),
+                "violation_type",
+                F.lit(1).cast("int").alias("strike_count"),
+                F.to_date(F.current_timestamp()).cast("string").alias("ingestion_date")
+            )
 
-        silver_df.write.format("delta").mode("append") \
-            .partitionBy("ingestion_date") \
-            .save(silver_path)
-        log.info(f"Batch {batch_id}: violation events written to Silver.")
+            silver_df.write.format("delta").mode("append") \
+                .partitionBy("ingestion_date") \
+                .save(silver_path)
+            log.info(f"Batch {batch_id}: violation events written to Silver.")
 
-      if batch_id % 20 == 0 and batch_id > 0:
-            log.info(f"Running OPTIMIZE on Silver (Batch {batch_id})...")
-            spark.sql(f"OPTIMIZE delta.`{silver_path}`")
+            if batch_id % 20 == 0 and batch_id > 0:
+                log.info(f"Running OPTIMIZE on Silver (Batch {batch_id})...")
+                spark.sql(f"OPTIMIZE delta.`{silver_path}`")
 
-        # AGGREGATE PER (driver_id, month) FOR GOLD       
-        batch_agg = silver_df.groupBy("driver_id", "month").agg(
-            F.sum("strike_count").alias("batch_strikes")
-        )
-             
-        rates_df = (   #iska kaam hai sirf join krke base rate provide krna 
-            active_assets
-            .groupBy("driver_id")
-            .agg(F.max("base_rate").alias("base_rate"))
-        )
+            # AGGREGATE PER (driver_id, month) FOR GOLD
+            batch_agg = silver_df.groupBy("driver_id", "month").agg(
+                F.sum("strike_count").alias("batch_strikes")
+            )
 
-        updates = (
-            batch_agg.join(rates_df, "driver_id", "inner") 
-            .withColumn("batch_id",  F.lit(batch_id))
-            .dropDuplicates(["driver_id", "month"])  # merge source must be unique on PK
-        )   
+            # Join to get base_rate from active SCD2 assets
+            rates_df = (
+                active_assets
+                .groupBy("driver_id")
+                .agg(F.max("base_rate").alias("base_rate"))
+            )
 
-         upsert_gold_delta(spark, updates, gold_path, batch_id)
+            updates = (
+                batch_agg.join(rates_df, "driver_id", "inner")
+                .withColumn("batch_id",  F.lit(batch_id))
+                .dropDuplicates(["driver_id", "month"])  # merge source must be unique on PK
+            )
 
-        if batch_id % 20 == 0 and batch_id > 0:
-            log.info(f"Running OPTIMIZE on Gold (Batch {batch_id})...")
-            spark.sql(f"OPTIMIZE delta.`{gold_path}`")
+            upsert_gold_delta(spark, updates, gold_path, batch_id)
 
-        changed_keys = updates.select("driver_id", "month").distinct()
-        changed_df   = (
-            spark.read.format("delta").load(gold_path)
-            .join(changed_keys, ["driver_id", "month"], "inner")
-        )
+            if batch_id % 20 == 0 and batch_id > 0:
+                log.info(f"Running OPTIMIZE on Gold (Batch {batch_id})...")
+                spark.sql(f"OPTIMIZE delta.`{gold_path}`")
 
-        upsert_postgres(changed_df, pg_conf)
-        log.info(f"Batch {batch_id} processed successfully.")
+            changed_keys = updates.select("driver_id", "month").distinct()
+            changed_df   = (
+                spark.read.format("delta").load(gold_path)
+                .join(changed_keys, ["driver_id", "month"], "inner")
+            )
+
+            upsert_postgres(changed_df, pg_conf)
+            log.info(f"Batch {batch_id} processed successfully.")
+
+        except Exception as e:
+            log.error(f"[process_batch] Batch {batch_id} failed: {e}")
+            log.error(traceback.format_exc())
+            raise
 
     query = (
         bronze_stream.writeStream
@@ -328,8 +334,12 @@ def main():
     )
 
     log.info("Processor started — consuming Bronze S3 → Silver → Gold → Postgres")
-    query.awaitTermination()
-
-
+    try:
+        query.awaitTermination()
+    except Exception as e:
+        log.error(f"[main] Streaming query terminated with error: {e}")
+        log.error(traceback.format_exc())
+        raise
+      
 if __name__ == "__main__":
     main()
