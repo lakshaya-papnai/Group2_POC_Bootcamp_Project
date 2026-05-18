@@ -26,7 +26,7 @@ GLUE_JOB_8 = "job8_monthly_cooldown"
 
 GLUE_COMMON_ARGS = {
     "--datalake-formats":          "delta",
-    "--additional-python-modules": "psycopg2-binary",
+    "--additional-python-modules": "psycopg2-binary,python-dotenv",
     "--enable-glue-datacatalog":   "true",
     "--enable-spark-ui":           "true",
     "--enable-job-insights":       "true",
