@@ -1,5 +1,14 @@
 import argparse
+import os
+import traceback
 import psycopg2
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+except ImportError:
+    pass  # On AWS Glue, environment variables are injected as Job Parameters
+from config import cfg
+from utils import execute_postgres_upsert
 from pyspark.sql import SparkSession
 from pyspark.sql.functions import col, countDistinct, current_timestamp, lit, to_date
 
@@ -23,11 +32,11 @@ DB_PASS = args.db_password
 DB_PORT = args.db_port
 
 # -------------------------------
-# PATHS
+# PATHS  (from config.py / .env)
 # -------------------------------
-SILVER_SCD2_PATH    = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_asset_history_scd2"
-SILVER_VEHICLE_PATH = "s3://ttn-de-bootcamp-silver-us-east-1/poc-bootcamp-grp2-silver/dim_vehicle"
-GOLD_PATH           = "s3://ttn-de-bootcamp-gold-us-east-1/poc-bootcamp-grp2-gold/active_fleet_snapshot"
+SILVER_SCD2_PATH    = cfg.SCD2_PATH
+SILVER_VEHICLE_PATH = cfg.DIM_VEHICLE_PATH
+GOLD_PATH           = cfg.GOLD_FLEET_SNAPSHOT_PATH
 
 # -------------------------------
 # WRITE S3  (idempotent replaceWhere)
@@ -55,21 +64,6 @@ def write_to_postgres(df):
         "driver":   "org.postgresql.Driver"
     }
 
-    # TRUNCATE staging before Spark write
-    conn = psycopg2.connect(
-        host=DB_HOST, port=DB_PORT, database=DB_NAME,
-        user=DB_USER, password=DB_PASS, connect_timeout=10
-    )
-    cur = conn.cursor()
-    cur.execute(f" TRUNCATE TABLE {staging_table};")
-    conn.commit()
-    cur.close()
-    conn.close()
-
-    # APPEND into staging via Spark JDBC
-    df.write.mode("append").jdbc(url=jdbc_url, table=staging_table, properties=props)
-
-    # UPSERT staging → target    
     upsert_sql = f"""
     INSERT INTO {target_table} (model, no_of_active_vehicles, snapshot_date, snapshot_time)
     SELECT model, no_of_active_vehicles, snapshot_date, snapshot_time
@@ -80,25 +74,23 @@ def write_to_postgres(df):
         snapshot_time         = EXCLUDED.snapshot_time;
     """
 
-    conn = None
-    cur  = None
-    try:
-        conn = psycopg2.connect(
-            host=DB_HOST, port=DB_PORT, database=DB_NAME,
-            user=DB_USER, password=DB_PASS, connect_timeout=10
-        )
-        cur = conn.cursor()
-        cur.execute(upsert_sql)
-        conn.commit()
-        
-    except Exception as e:
-        if conn:
-            conn.rollback()        
-        raise
+    pg_connect_kwargs = {
+        "host": DB_HOST,
+        "port": DB_PORT,
+        "database": DB_NAME,
+        "user": DB_USER,
+        "password": DB_PASS,
+        "connect_timeout": 10
+    }
 
-    finally:
-        if cur:  cur.close()
-        if conn: conn.close()
+    execute_postgres_upsert(
+        df=df,
+        jdbc_url=jdbc_url,
+        staging_table=staging_table,
+        upsert_sql=upsert_sql,
+        pg_connect_kwargs=pg_connect_kwargs,
+        jdbc_props=props
+    )
 
 # -------------------------------
 # MAIN PIPELINE
@@ -134,4 +126,11 @@ def main():
     spark.stop()
     
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print(f"JOB 5 FAILED: {e}")
+        print("Detailed Error Traceback:")
+        print(traceback.format_exc())
+        raise
